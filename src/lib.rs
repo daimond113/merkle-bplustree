@@ -19,7 +19,7 @@ use crate::{
         GetWithProof,
         delete::DeleteProof,
         modify::ModifyProof,
-        range::{GetRangeProof, RangeProofBuilder, range_impl},
+        range::{Plain, RangeItem, RangeProofEmitter, range_impl},
     },
     shape::Shaper,
     storage::{ReadNodeStorage, WriteNodeStorage},
@@ -169,7 +169,7 @@ impl<C: TreeConfig, S: ReadNodeStorage<C>> MerkleBPlusTree<C, S> {
             self.root.as_ref().unwrap().borrowed(),
             range,
             map,
-            (),
+            Plain::new(),
         )
     }
 
@@ -185,13 +185,13 @@ impl<C: TreeConfig, S: ReadNodeStorage<C>> MerkleBPlusTree<C, S> {
         self.range_mapped(range, |k, v| (k.clone(), v.clone()))
     }
 
-    /// Returns all entries within the provided range bounds, mapped, alongside cryptographic proof
-    /// of the completion of the values.
+    /// Returns all entries within the provided range bounds, mapped, interwoven with
+    /// cryptographic proof of the completion of the values.
     pub fn proven_range_mapped<'a, Q: Ord + ?Sized + 'a, R>(
         &'a self,
         range: impl RangeBounds<Q>,
         map: impl Fn(&C::Key, &C::Value) -> R,
-    ) -> impl Stream<Item = Result<R, S::Error>> + GetRangeProof<C>
+    ) -> impl Stream<Item = Result<RangeItem<C, R>, S::Error>>
     where
         C::Key: Borrow<Q>,
         S: Sync,
@@ -201,16 +201,16 @@ impl<C: TreeConfig, S: ReadNodeStorage<C>> MerkleBPlusTree<C, S> {
             self.root.as_ref().unwrap().borrowed(),
             range,
             map,
-            RangeProofBuilder::default(),
+            RangeProofEmitter::new(),
         )
     }
 
-    /// Returns all entries within the provided range bounds alongside cryptographic proof
-    /// of the completion of the values.
+    /// Returns all entries within the provided range bounds, mapped, interwoven with
+    /// cryptographic proof of the completion of the values.
     pub fn proven_range<'a, Q: Ord + ?Sized + 'a>(
         &'a self,
         range: impl RangeBounds<Q>,
-    ) -> impl Stream<Item = Result<(C::Key, C::Value), S::Error>> + GetRangeProof<C>
+    ) -> impl Stream<Item = Result<RangeItem<C, (C::Key, C::Value)>, S::Error>>
     where
         C::Key: Borrow<Q>,
         S: Sync,
@@ -218,7 +218,7 @@ impl<C: TreeConfig, S: ReadNodeStorage<C>> MerkleBPlusTree<C, S> {
         self.proven_range_mapped(range, |k, v| (k.clone(), v.clone()))
     }
 
-    /// Returns all entries within the provided range bounds, mapped. Consumes self.
+    /// Consuming version of [`Self::range_mapped`].
     pub fn into_range_mapped<Q: Ord + ?Sized + 'static, R>(
         self,
         range: impl RangeBounds<Q>,
@@ -228,10 +228,10 @@ impl<C: TreeConfig, S: ReadNodeStorage<C>> MerkleBPlusTree<C, S> {
         C::Key: Borrow<Q>,
         S: Send + Sync + 'static,
     {
-        range_impl(self.storage, self.root.unwrap(), range, map, ())
+        range_impl(self.storage, self.root.unwrap(), range, map, Plain::new())
     }
 
-    /// Returns all entries within the provided range bounds. Consumes self.
+    /// Consuming version of [`Self::range`].
     pub fn into_range<Q: Ord + ?Sized + 'static>(
         self,
         range: impl RangeBounds<Q>,
@@ -243,13 +243,12 @@ impl<C: TreeConfig, S: ReadNodeStorage<C>> MerkleBPlusTree<C, S> {
         self.into_range_mapped(range, |k, v| (k.clone(), v.clone()))
     }
 
-    /// Returns all entries within the provided range bounds, mapped, alongside cryptographic proof
-    /// of the completion of the values. Consumes self.
+    /// Consuming version of [`Self::proven_range_mapped`].
     pub fn into_proven_range_mapped<Q: Ord + ?Sized + 'static, R>(
         self,
         range: impl RangeBounds<Q>,
         map: impl Fn(&C::Key, &C::Value) -> R,
-    ) -> impl Stream<Item = Result<R, S::Error>> + GetRangeProof<C>
+    ) -> impl Stream<Item = Result<RangeItem<C, R>, S::Error>>
     where
         C::Key: Borrow<Q>,
         S: Send + Sync + 'static,
@@ -259,16 +258,15 @@ impl<C: TreeConfig, S: ReadNodeStorage<C>> MerkleBPlusTree<C, S> {
             self.root.unwrap(),
             range,
             map,
-            RangeProofBuilder::default(),
+            RangeProofEmitter::new(),
         )
     }
 
-    /// Returns all entries within the provided range bounds alongside cryptographic proof
-    /// of the completion of the values. Consumes self.
+    /// Consuming version of [`Self::proven_range`].
     pub fn into_proven_range<Q: Ord + ?Sized + 'static>(
         self,
         range: impl RangeBounds<Q>,
-    ) -> impl Stream<Item = Result<(C::Key, C::Value), S::Error>> + GetRangeProof<C>
+    ) -> impl Stream<Item = Result<RangeItem<C, (C::Key, C::Value)>, S::Error>>
     where
         C::Key: Borrow<Q>,
         S: Send + Sync + 'static,
