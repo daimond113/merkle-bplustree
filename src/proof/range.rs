@@ -10,7 +10,7 @@ use std::{
 
 use derive_where::derive_where;
 use futures_util::{
-    FutureExt as _, Stream, StreamExt as _,
+    FutureExt as _, Stream,
     future::{BoxFuture, Either, try_join},
 };
 
@@ -375,14 +375,6 @@ where
 /// An item of a proven range, that is either an entry or a proof node.
 #[derive_where(Debug; R, RangeProofNode<C>)]
 #[derive_where(Clone; R)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "serde",
-    serde(bound(
-        serialize = "R: serde::Serialize, RangeProofNode<C>: serde::Serialize",
-        deserialize = "R: serde::Deserialize<'de>, RangeProofNode<C>: serde::Deserialize<'de>"
-    ))
-)]
 pub enum RangeItem<C: TreeConfig, R> {
     /// An entry within a leaf,
     Entry(R),
@@ -501,107 +493,245 @@ struct VerifyFrame<C: TreeConfig> {
     base: usize,
 }
 
-/// Verifies that `entries` are exactly the entries within `range` of the tree `expected_root` represents.
-///
-/// The entries must be provided in ascending key order and are consumed as they arrive.
-pub async fn verify_range<C: TreeConfig, Q: Ord + ?Sized, K: Borrow<C::Key>, V: Borrow<C::Value>>(
-    expected_root: &HasherOutput<C>,
-    range: impl RangeBounds<Q>,
-    items: impl Stream<Item = RangeItem<C, (K, V)>>,
-) -> Result<(), InvalidProofError>
+/// A verifier for a range query.
+pub trait RangeVerifier<C: TreeConfig> {
+    /// Pushes the next proof node as produced by the query.
+    fn push_node(&mut self, node: RangeProofNode<C>) -> Result<(), InvalidProofError>;
+
+    /// Pushes the next entry as produced by the query.
+    fn push_entry<K: Borrow<C::Key>, V: Borrow<C::Value>>(
+        &mut self,
+        key: K,
+        value: V,
+    ) -> Result<(), InvalidProofError>;
+
+    /// Verifies whether the provided values were correct & complete in accordance to `expected_root`.
+    fn finish(self, expected_root: &HasherOutput<C>) -> Result<(), InvalidProofError>;
+}
+
+/// Returns a [RangeVerifier] for the given range.
+pub fn range_verifier<C: TreeConfig, Q: Ord + ?Sized, B: RangeBounds<Q>>(
+    range: B,
+) -> impl RangeVerifier<C>
 where
     C::Key: Borrow<Q>,
 {
-    let mut items = std::pin::pin!(items);
-
     if is_empty_range(&range) {
-        return match items.next().await {
-            None => Ok(()),
-            Some(_) => Err(InvalidProofError),
-        };
+        return RangeVerifierImpl::Empty;
     }
 
-    let mut stack = vec![];
-    let mut buf = vec![];
-    let mut bounds = (None, None);
-    let mut done = None;
+    RangeVerifierImpl::Active(ActiveVerifier {
+        range,
+        stack: Vec::new(),
+        buf: Vec::new(),
+        bounds: (None, None),
+        phase: VerifyPhase::Expecting,
+        _phantom: PhantomData,
+    })
+}
 
-    while let Some(item) = items.next().await {
-        if done.is_some() {
+enum RangeVerifierImpl<C: TreeConfig, Q: ?Sized, B> {
+    Empty,
+    Active(ActiveVerifier<C, Q, B>),
+    Failed,
+}
+
+impl<C: TreeConfig, Q: ?Sized, B> RangeVerifierImpl<C, Q, B> {
+    fn advance(
+        &mut self,
+        step: impl FnOnce(ActiveVerifier<C, Q, B>) -> Result<ActiveVerifier<C, Q, B>, InvalidProofError>,
+    ) -> Result<(), InvalidProofError> {
+        match std::mem::replace(self, Self::Failed) {
+            Self::Active(active) => {
+                *self = Self::Active(step(active)?);
+                Ok(())
+            }
+            Self::Empty | Self::Failed => Err(InvalidProofError),
+        }
+    }
+}
+
+impl<C: TreeConfig, Q: Ord + ?Sized, B: RangeBounds<Q>> RangeVerifier<C>
+    for RangeVerifierImpl<C, Q, B>
+where
+    C::Key: Borrow<Q>,
+{
+    fn push_node(&mut self, node: RangeProofNode<C>) -> Result<(), InvalidProofError> {
+        self.advance(|active| active.step_node(node))
+    }
+
+    fn push_entry<K: Borrow<C::Key>, V: Borrow<C::Value>>(
+        &mut self,
+        key: K,
+        value: V,
+    ) -> Result<(), InvalidProofError> {
+        self.advance(|active| active.step_entry(key, value))
+    }
+
+    fn finish(self, expected_root: &HasherOutput<C>) -> Result<(), InvalidProofError> {
+        match self {
+            Self::Empty => Ok(()),
+            Self::Active(ActiveVerifier {
+                phase: VerifyPhase::Done(root),
+                ..
+            }) if root == *expected_root => Ok(()),
+            Self::Active(_) | Self::Failed => Err(InvalidProofError),
+        }
+    }
+}
+
+enum VerifyPhase<C: TreeConfig> {
+    Expecting,
+    Entries {
+        base: usize,
+        remaining: usize,
+        after: Box<[(C::Key, HasherOutput<C>)]>,
+    },
+    Done(HasherOutput<C>),
+}
+
+struct ActiveVerifier<C: TreeConfig, Q: ?Sized, B> {
+    range: B,
+    stack: Vec<VerifyFrame<C>>,
+    buf: Vec<HasherOutput<C>>,
+    bounds: (Option<C::Key>, Option<C::Key>),
+    phase: VerifyPhase<C>,
+    _phantom: PhantomData<fn(&Q)>,
+}
+
+impl<C: TreeConfig, Q: Ord + ?Sized, B: RangeBounds<Q>> ActiveVerifier<C, Q, B>
+where
+    C::Key: Borrow<Q>,
+{
+    fn step_node(mut self, node: RangeProofNode<C>) -> Result<Self, InvalidProofError> {
+        if !matches!(self.phase, VerifyPhase::Expecting) {
             return Err(InvalidProofError);
         }
 
-        let RangeItem::Node(node) = item else {
-            return Err(InvalidProofError);
-        };
-
-        match node {
+        let done = match node {
             RangeProofNode::Internal { keys, children } => {
                 if keys.len() + 1 != children.len() {
                     return Err(InvalidProofError);
                 }
 
-                stack.push(VerifyFrame::<C> {
+                self.stack.push(VerifyFrame::<C> {
                     keys,
                     children,
-                    lower: bounds.0.take(),
-                    upper: bounds.1.take(),
+                    lower: self.bounds.0.take(),
+                    upper: self.bounds.1.take(),
                     next: 0,
-                    base: buf.len(),
+                    base: self.buf.len(),
                 });
+
+                None
             }
             RangeProofNode::Leaf {
                 before,
                 inside,
                 after,
             } => {
-                let base = buf.len();
+                let base = self.buf.len();
 
                 for (key, value_hash) in &before {
-                    if (range.start_bound(), Bound::Unbounded).contains(key.borrow()) {
+                    if (self.range.start_bound(), Bound::Unbounded).contains(key.borrow()) {
                         return Err(InvalidProofError);
                     }
-                    buf.push(C::Hasher::hash_key(key));
-                    buf.push(value_hash.clone());
+                    self.buf.push(C::Hasher::hash_key(key));
+                    self.buf.push(value_hash.clone());
                 }
 
-                for _ in 0..inside {
-                    let Some(RangeItem::Entry((key, value))) = items.next().await else {
-                        return Err(InvalidProofError);
+                if inside > 0 {
+                    self.phase = VerifyPhase::Entries {
+                        base,
+                        remaining: inside,
+                        after,
                     };
-
-                    let key = key.borrow();
-                    let value = value.borrow();
-                    if !range.contains(key.borrow()) {
-                        return Err(InvalidProofError);
-                    }
-
-                    buf.push(C::Hasher::hash_key(key));
-                    buf.push(C::Hasher::hash_value(value));
+                    return Ok(self);
                 }
 
-                for (key, value_hash) in &after {
-                    if (Bound::Unbounded, range.end_bound()).contains(key.borrow()) {
-                        return Err(InvalidProofError);
-                    }
-
-                    buf.push(C::Hasher::hash_key(key));
-                    buf.push(value_hash.clone());
-                }
-
-                let count = (buf.len() - base) >> 1usize;
-                let entries_root = merkle_root_in_place::<C>(&mut buf, base);
-                done = Some(C::Hasher::hash_leaf(count, &entries_root));
+                Some(self.complete_leaf(base, &after)?)
             }
+        };
+
+        self.resume(done)
+    }
+
+    fn step_entry<K: Borrow<C::Key>, V: Borrow<C::Value>>(
+        mut self,
+        key: K,
+        value: V,
+    ) -> Result<Self, InvalidProofError> {
+        let VerifyPhase::Entries {
+            base,
+            mut remaining,
+            after,
+        } = std::mem::replace(&mut self.phase, VerifyPhase::Expecting)
+        else {
+            return Err(InvalidProofError);
+        };
+
+        let key = key.borrow();
+        let value = value.borrow();
+        if !self.range.contains(key.borrow()) {
+            return Err(InvalidProofError);
         }
 
-        while let Some(frame) = stack.last_mut() {
+        self.buf.push(C::Hasher::hash_key(key));
+        self.buf.push(C::Hasher::hash_value(value));
+        remaining -= 1;
+
+        if remaining > 0 {
+            self.phase = VerifyPhase::Entries {
+                base,
+                remaining,
+                after,
+            };
+            return Ok(self);
+        }
+
+        let done = self.complete_leaf(base, &after)?;
+        self.resume(Some(done))
+    }
+
+    fn resume(mut self, done: Option<HasherOutput<C>>) -> Result<Self, InvalidProofError> {
+        self.phase = match self.settle(done)? {
+            Some(root) => VerifyPhase::Done(root),
+            None => VerifyPhase::Expecting,
+        };
+
+        Ok(self)
+    }
+
+    fn complete_leaf(
+        &mut self,
+        base: usize,
+        after: &[(C::Key, HasherOutput<C>)],
+    ) -> Result<HasherOutput<C>, InvalidProofError> {
+        for (key, value_hash) in after {
+            if (Bound::Unbounded, self.range.end_bound()).contains(key.borrow()) {
+                return Err(InvalidProofError);
+            }
+
+            self.buf.push(C::Hasher::hash_key(key));
+            self.buf.push(value_hash.clone());
+        }
+
+        let count = (self.buf.len() - base) >> 1usize;
+        let entries_root = merkle_root_in_place::<C>(&mut self.buf, base);
+        Ok(C::Hasher::hash_leaf(count, &entries_root))
+    }
+
+    fn settle(
+        &mut self,
+        mut done: Option<HasherOutput<C>>,
+    ) -> Result<Option<HasherOutput<C>>, InvalidProofError> {
+        while let Some(frame) = self.stack.last_mut() {
             if let Some(hash) = done.take() {
                 if hash != frame.children[frame.next] {
                     return Err(InvalidProofError);
                 }
 
-                buf.push(if frame.next == 0 {
+                self.buf.push(if frame.next == 0 {
                     hash
                 } else {
                     C::Hasher::hash_slot(&frame.keys[frame.next - 1], &hash)
@@ -618,22 +748,22 @@ where
                 let upper = frame.keys.get(frame.next).or(frame.upper.as_ref());
 
                 let below = matches!(
-                    (upper, range.start_bound()),
+                    (upper, self.range.start_bound()),
                     (Some(upper), Bound::Included(start) | Bound::Excluded(start))
                         if upper.borrow() <= start
                 );
-                let above = match (lower, range.end_bound()) {
+                let above = match (lower, self.range.end_bound()) {
                     (Some(lower), Bound::Included(end)) => lower.borrow() > end,
                     (Some(lower), Bound::Excluded(end)) => lower.borrow() >= end,
                     _ => false,
                 };
 
                 if !below && !above {
-                    bounds = (lower.cloned(), upper.cloned());
+                    self.bounds = (lower.cloned(), upper.cloned());
                     break;
                 }
 
-                buf.push(if frame.next == 0 {
+                self.buf.push(if frame.next == 0 {
                     frame.children[0].clone()
                 } else {
                     C::Hasher::hash_slot(&frame.keys[frame.next - 1], &frame.children[frame.next])
@@ -646,18 +776,13 @@ where
                 break;
             }
 
-            let frame = stack.pop().unwrap();
-            let slots_root = merkle_root_in_place::<C>(&mut buf, frame.base);
+            let frame = self.stack.pop().unwrap();
+            let slots_root = merkle_root_in_place::<C>(&mut self.buf, frame.base);
             done = Some(C::Hasher::hash_internal(frame.children.len(), &slots_root));
         }
-    }
 
-    let root = done.ok_or(InvalidProofError)?;
-    if root != *expected_root {
-        return Err(InvalidProofError);
+        Ok(done)
     }
-
-    Ok(())
 }
 
 fn leaf_start<C: TreeConfig, Q: Ord + ?Sized>(leaf: &TreeLeafNode<C>, lower: Bound<&Q>) -> usize
@@ -779,10 +904,11 @@ where
 mod tests {
     use std::ops::{Bound, RangeBounds as _};
 
-    use futures_util::{TryStreamExt as _, stream};
+    use futures_util::TryStreamExt as _;
 
-    use super::{RangeItem, RangeProofNode, verify_range};
+    use super::{RangeItem, RangeProofNode, RangeVerifier, range_verifier};
     use crate::hasher::Hasher as _;
+    use crate::proof::InvalidProofError;
     use crate::tests::{
         Blake3Hasher, TestConfig, TestTree, all_test_shapers, corrupt, filled_tree,
         filled_tree_with_shaper, insert_orders, new_tree, value_for,
@@ -969,10 +1095,24 @@ mod tests {
             .collect()
     }
 
-    async fn verifies(items: &[Item], root: &[u8; 32], range: Bounds) -> bool {
-        verify_range(root, range, stream::iter(items.iter().cloned()))
-            .await
-            .is_ok()
+    fn push_item(
+        verifier: &mut impl RangeVerifier<TestConfig>,
+        item: Item,
+    ) -> Result<(), InvalidProofError> {
+        match item {
+            RangeItem::Node(node) => verifier.push_node(node),
+            RangeItem::Entry((key, value)) => verifier.push_entry(key, value),
+        }
+    }
+
+    fn verifies(items: &[Item], root: &[u8; 32], range: Bounds) -> bool {
+        let mut verifier = range_verifier::<TestConfig, u64, _>(range);
+        for item in items.iter().cloned() {
+            if push_item(&mut verifier, item).is_err() {
+                return false;
+            }
+        }
+        verifier.finish(root).is_ok()
     }
 
     fn bounds_for(n: u64) -> Vec<Bounds> {
@@ -1013,7 +1153,7 @@ mod tests {
                         "shaper={s:?} n={n} bounds={bounds:?}: entries mismatch"
                     );
                     assert!(
-                        verifies(&items, &root, bounds).await,
+                        verifies(&items, &root, bounds),
                         "shaper={s:?} n={n} bounds={bounds:?}: range proof failed to verify",
                     );
                 }
@@ -1039,7 +1179,7 @@ mod tests {
                 .collect();
             assert_eq!(entries_of(&items), expected, "insert_order={label}");
             assert!(
-                verifies(&items, &root, bounds).await,
+                verifies(&items, &root, bounds),
                 "insert_order={label}: range proof failed to verify",
             );
         }
@@ -1051,7 +1191,7 @@ mod tests {
         let root = tree.root_hash();
         let bounds = (Bound::Included(7u64), Bound::Excluded(31u64));
         let items = proven(&tree, bounds).await;
-        assert!(verifies(&items, &root, bounds).await);
+        assert!(verifies(&items, &root, bounds));
 
         let positions = entry_positions(&items);
 
@@ -1059,7 +1199,7 @@ mod tests {
             let mut dropped = items.clone();
             dropped.remove(pos);
             assert!(
-                !verifies(&dropped, &root, bounds).await,
+                !verifies(&dropped, &root, bounds),
                 "dropping entry {n} must invalidate",
             );
         }
@@ -1069,21 +1209,21 @@ mod tests {
             positions[positions.len() - 1] + 1,
             RangeItem::Entry((1000, "extra".to_string())),
         );
-        assert!(!verifies(&extra, &root, bounds).await);
+        assert!(!verifies(&extra, &root, bounds));
 
         let mut trailing = items.clone();
         trailing.push(RangeItem::Entry((1000, "extra".to_string())));
-        assert!(!verifies(&trailing, &root, bounds).await);
+        assert!(!verifies(&trailing, &root, bounds));
 
         let mut modified = items.clone();
         if let RangeItem::Entry((_, v)) = &mut modified[positions[3]] {
             v.push('x');
         }
-        assert!(!verifies(&modified, &root, bounds).await);
+        assert!(!verifies(&modified, &root, bounds));
 
         let mut reordered = items.clone();
         reordered.swap(positions[0], positions[1]);
-        assert!(!verifies(&reordered, &root, bounds).await);
+        assert!(!verifies(&reordered, &root, bounds));
 
         let mut all = Vec::new();
         all.extend(
@@ -1093,7 +1233,7 @@ mod tests {
                 .cloned(),
         );
         all.extend((0..40u64).map(|k| RangeItem::Entry((k, value_for(k)))));
-        assert!(!verifies(&all, &root, bounds).await);
+        assert!(!verifies(&all, &root, bounds));
     }
 
     #[tokio::test]
@@ -1108,12 +1248,12 @@ mod tests {
         let root_b = tree_b.root_hash();
         let bounds = (Bound::Included(7u64), Bound::Excluded(31u64));
         let items = proven(&tree_a, bounds).await;
-        assert!(verifies(&items, &root_a, bounds).await);
-        assert!(!verifies(&items, &root_b, bounds).await);
+        assert!(verifies(&items, &root_a, bounds));
+        assert!(!verifies(&items, &root_b, bounds));
 
         let mut bad_root = root_a;
         corrupt(&mut bad_root);
-        assert!(!verifies(&items, &bad_root, bounds).await);
+        assert!(!verifies(&items, &bad_root, bounds));
     }
 
     #[tokio::test]
@@ -1130,7 +1270,7 @@ mod tests {
                 break;
             }
         }
-        assert!(!verifies(&corrupted, &root, bounds).await);
+        assert!(!verifies(&corrupted, &root, bounds));
 
         let mut hidden = items.clone();
         let pos = hidden
@@ -1148,7 +1288,7 @@ mod tests {
             *before = moved.into_boxed_slice();
             *inside -= 1;
         }
-        assert!(!verifies(&hidden, &root, bounds).await);
+        assert!(!verifies(&hidden, &root, bounds));
 
         let mut truncated = items.clone();
         let last_node = truncated
@@ -1156,15 +1296,15 @@ mod tests {
             .rposition(|i| matches!(i, RangeItem::Node(_)))
             .unwrap();
         truncated.truncate(last_node);
-        assert!(!verifies(&truncated, &root, bounds).await);
+        assert!(!verifies(&truncated, &root, bounds));
 
         let mut cut_short = items.clone();
         cut_short.pop();
-        assert!(!verifies(&cut_short, &root, bounds).await);
+        assert!(!verifies(&cut_short, &root, bounds));
 
         let mut padded = items.clone();
         padded.push(items[0].clone());
-        assert!(!verifies(&padded, &root, bounds).await);
+        assert!(!verifies(&padded, &root, bounds));
     }
 
     #[tokio::test]
@@ -1174,7 +1314,64 @@ mod tests {
         let bounds = (Bound::Included(5u64), Bound::Excluded(5u64));
         let items = proven(&tree, bounds).await;
         assert!(items.is_empty());
-        assert!(verifies(&items, &root, bounds).await);
-        assert!(!verifies(&[RangeItem::Entry((5, "v5".to_string()))], &root, bounds).await);
+        assert!(verifies(&items, &root, bounds));
+        assert!(!verifies(
+            &[RangeItem::Entry((5, "v5".to_string()))],
+            &root,
+            bounds
+        ));
+    }
+
+    #[tokio::test]
+    async fn verifier_reports_errors_on_push_and_stays_failed() {
+        let tree = filled_tree(4, 3, 0..20u64).await;
+        let root = tree.root_hash();
+        let bounds = (Bound::Included(2u64), Bound::Excluded(9u64));
+        let items = proven(&tree, bounds).await;
+
+        let mut verifier = range_verifier::<TestConfig, u64, _>(bounds);
+        assert!(verifier.push_entry(2u64, value_for(2)).is_err());
+        for item in items {
+            assert!(push_item(&mut verifier, item).is_err());
+        }
+        assert!(verifier.finish(&root).is_err());
+    }
+
+    #[tokio::test]
+    async fn verifier_rejects_incomplete_leaf_on_finish() {
+        let tree = filled_tree(4, 3, 0..20u64).await;
+        let root = tree.root_hash();
+        let bounds = (Bound::Included(2u64), Bound::Excluded(9u64));
+        let items = proven(&tree, bounds).await;
+
+        let cut = items
+            .iter()
+            .position(|i| matches!(i, RangeItem::Entry(_)))
+            .unwrap();
+
+        let mut verifier = range_verifier::<TestConfig, u64, _>(bounds);
+        for item in items[..cut].iter().cloned() {
+            assert!(push_item(&mut verifier, item).is_ok());
+        }
+        assert!(verifier.finish(&root).is_err());
+    }
+
+    #[tokio::test]
+    async fn verifier_accepts_borrowed_and_owned_entries() {
+        let tree = filled_tree(4, 3, 0..20u64).await;
+        let root = tree.root_hash();
+        let bounds = (Bound::Included(2u64), Bound::Excluded(9u64));
+        let items = proven(&tree, bounds).await;
+
+        let mut verifier = range_verifier::<TestConfig, u64, _>(bounds);
+        for (n, item) in items.into_iter().enumerate() {
+            let result = match item {
+                RangeItem::Node(node) => verifier.push_node(node),
+                RangeItem::Entry((key, value)) if n % 2 == 0 => verifier.push_entry(&key, &value),
+                RangeItem::Entry((key, value)) => verifier.push_entry(key, value),
+            };
+            assert!(result.is_ok());
+        }
+        assert!(verifier.finish(&root).is_ok());
     }
 }
