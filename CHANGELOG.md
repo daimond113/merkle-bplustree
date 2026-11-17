@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ModifyProof::verify` now returns a boolean indicating whether the value was
+inserted or only modified in-place by @daimond113
 
 ### Changed
 

@@ -322,6 +322,8 @@ pub struct ModifyProof<C: TreeConfig> {
 impl<C: TreeConfig> ModifyProof<C> {
     /// Verifies that `old_root` has become `new_root` by setting `key` to `new_value` and
     /// respecting B+Tree invariants in doing so.
+    ///
+    /// Returns a boolean of whether the value was inserted or merely updated.
     pub fn verify<Q: Ord + ?Sized>(
         &self,
         old_root: &HasherOutput<C>,
@@ -329,11 +331,12 @@ impl<C: TreeConfig> ModifyProof<C> {
         key: &Q,
         new_value: &C::Value,
         shaper: &C::Shaper,
-    ) -> Result<(), InvalidProofError>
+    ) -> Result<bool, InvalidProofError>
     where
         C::Key: Borrow<Q>,
     {
         let value_hash = C::Hasher::hash_value(new_value);
+        let mut inserted = false;
         verify_transition::<C, _>(
             &self.nodes,
             old_root,
@@ -341,8 +344,14 @@ impl<C: TreeConfig> ModifyProof<C> {
             key,
             &value_hash,
             shaper,
-            |_, new| new == Some(&value_hash),
-        )
+            |old, new| {
+                if old.is_none() {
+                    inserted = true;
+                }
+                new == Some(&value_hash)
+            },
+        )?;
+        Ok(inserted)
     }
 }
 
@@ -549,11 +558,14 @@ mod tests {
                 let old_root = tree.root_hash();
                 let proof = tree.insert_new_with_proof(n, value_for(n)).await.unwrap();
                 let new_root = tree.root_hash();
+                let inserted = proof
+                    .verify(&old_root, &new_root, &n, &value_for(n), &s)
+                    .unwrap_or_else(|e| {
+                        panic!("shaper={s:?} n={n}: insert proof failed to verify: {e:?}")
+                    });
                 assert!(
-                    proof
-                        .verify(&old_root, &new_root, &n, &value_for(n), &s)
-                        .is_ok(),
-                    "shaper={s:?} n={n}: insert proof failed to verify",
+                    inserted,
+                    "shaper={s:?} n={n}: new key must be reported as inserted",
                 );
             }
         }
@@ -571,11 +583,14 @@ mod tests {
                         .await
                         .unwrap();
                     let new_root = tree.root_hash();
+                    let inserted = proof
+                        .verify(&old_root, &new_root, &k, &format!("new-v{k}"), &s)
+                        .unwrap_or_else(|e| {
+                            panic!("shaper={s:?} n={n} k={k}: update proof failed to verify: {e:?}")
+                        });
                     assert!(
-                        proof
-                            .verify(&old_root, &new_root, &k, &format!("new-v{k}"), &s)
-                            .is_ok(),
-                        "shaper={s:?} n={n} k={k}: update proof failed to verify",
+                        !inserted,
+                        "shaper={s:?} n={n} k={k}: existing key must be reported as updated",
                     );
                 }
             }
@@ -589,11 +604,10 @@ mod tests {
         let old_root = tree.root_hash();
         let (_, proof) = tree.insert_with_proof(5, "new".into()).await.unwrap();
         let new_root = tree.root_hash();
-        assert!(
-            proof
-                .verify(&old_root, &new_root, &5, &"new".to_string(), &s)
-                .is_ok()
-        );
+        let inserted = proof
+            .verify(&old_root, &new_root, &5, &"new".to_string(), &s)
+            .unwrap();
+        assert!(!inserted, "key 5 already existed, so this is an update");
         assert!(
             proof
                 .verify(&old_root, &new_root, &5, &"wrong".to_string(), &s)
@@ -636,11 +650,10 @@ mod tests {
         let old_root = tree.root_hash();
         let (_, proof) = tree.insert_with_proof(5, "updated".into()).await.unwrap();
         let new_root = tree.root_hash();
-        assert!(
-            proof
-                .verify(&old_root, &new_root, &5, &"updated".to_string(), &s)
-                .is_ok()
-        );
+        let inserted = proof
+            .verify(&old_root, &new_root, &5, &"updated".to_string(), &s)
+            .unwrap();
+        assert!(!inserted, "key 5 already existed, so this is an update");
         let mut bad_old_root = old_root;
         corrupt(&mut bad_old_root);
         assert!(
