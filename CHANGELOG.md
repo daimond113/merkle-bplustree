@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Removed
+
+## [0.3.0] - 2026-11-17
+
+### Added
 - `ModifyProof::verify` now returns a boolean indicating whether the value was
 inserted or only modified in-place by @daimond113
 
@@ -29,5 +37,6 @@ by @daimond113
 
 Initial release
 
+[0.3.0]: https://github.com/daimond113/merkle-bplustree/compare/v0.2.0..v0.3.0
 [0.2.0]: https://github.com/daimond113/merkle-bplustree/compare/v0.1.0..v0.2.0
 [0.1.0]: https://github.com/daimond113/merkle-bplustree/tree/v0.1.0

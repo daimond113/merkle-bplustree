@@ -1,6 +1,6 @@
 [package]
 name = "merkle-bplustree"
-version = "0.2.0"
+version = "0.3.0"
 description = "Implementation of a B+Tree that utilises Merkle Trees."
 edition = "2024"
 repository = "https://github.com/daimond113/merkle-bplustree"
