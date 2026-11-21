@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Removed
+
+## [0.3.1] - 2026-11-21
+
+### Added
 - Modify proofs can now optionally return the old value's hash by @daimond113
 - Delete proofs can now verify directly with the old value's hash by @daimond113
 
@@ -39,6 +47,7 @@ by @daimond113
 
 Initial release
 
+[0.3.1]: https://github.com/daimond113/merkle-bplustree/compare/v0.3.0..v0.3.1
 [0.3.0]: https://github.com/daimond113/merkle-bplustree/compare/v0.2.0..v0.3.0
 [0.2.0]: https://github.com/daimond113/merkle-bplustree/compare/v0.1.0..v0.2.0
 [0.1.0]: https://github.com/daimond113/merkle-bplustree/tree/v0.1.0
