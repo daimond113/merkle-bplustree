@@ -353,6 +353,35 @@ impl<C: TreeConfig> ModifyProof<C> {
         )?;
         Ok(inserted)
     }
+
+    /// [Self::verify], except returns the old value's hash, if any.
+    pub fn verify_unwrap<Q: Ord + ?Sized>(
+        &self,
+        old_root: &HasherOutput<C>,
+        new_root: &HasherOutput<C>,
+        key: &Q,
+        new_value: &C::Value,
+        shaper: &C::Shaper,
+    ) -> Result<Option<HasherOutput<C>>, InvalidProofError>
+    where
+        C::Key: Borrow<Q>,
+    {
+        let value_hash = C::Hasher::hash_value(new_value);
+        let mut old_hash = None;
+        verify_transition::<C, _>(
+            &self.nodes,
+            old_root,
+            new_root,
+            key,
+            &value_hash,
+            shaper,
+            |old, new| {
+                old_hash = old.cloned();
+                new == Some(&value_hash)
+            },
+        )?;
+        Ok(old_hash)
+    }
 }
 
 #[cfg(test)]

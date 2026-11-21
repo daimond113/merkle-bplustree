@@ -479,6 +479,29 @@ impl<C: TreeConfig> DeleteProof<C> {
             |old, new| old == Some(&value_hash) && new.is_none(),
         )
     }
+
+    /// [Self::verify], except allows passing the old value's hash directly.
+    pub fn verify_hash<Q: Ord + ?Sized>(
+        &self,
+        old_root: &HasherOutput<C>,
+        new_root: &HasherOutput<C>,
+        key: &Q,
+        value_hash: &HasherOutput<C>,
+        shaper: &C::Shaper,
+    ) -> Result<(), InvalidProofError>
+    where
+        C::Key: Borrow<Q>,
+    {
+        verify_transition::<C, _>(
+            &self.nodes,
+            old_root,
+            new_root,
+            key,
+            value_hash,
+            shaper,
+            |old, new| old == Some(value_hash) && new.is_none(),
+        )
+    }
 }
 
 #[cfg(test)]

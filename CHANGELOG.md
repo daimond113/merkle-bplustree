@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Modify proofs can now optionally return the old value's hash by @daimond113
+- Delete proofs can now verify directly with the old value's hash by @daimond113
 
 ### Changed
 
